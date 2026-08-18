@@ -24,6 +24,8 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -397,6 +399,15 @@ func TestSyncConditions(t *testing.T) {
 	})
 }
 
+// wireDeadlineExceeded returns a deadline error in the shape the controller
+// actually receives. The SDK registers errorInterceptor as its outermost unary
+// interceptor and rewrites every call error through
+// serviceerror.FromStatus(status.Convert(err)), so a gRPC deadline arrives as
+// *serviceerror.DeadlineExceeded rather than as the context sentinel.
+func wireDeadlineExceeded() error {
+	return serviceerror.FromStatus(grpcstatus.New(codes.DeadlineExceeded, "context deadline exceeded"))
+}
+
 func TestShouldEvictClient(t *testing.T) {
 	tests := []struct {
 		name string
@@ -412,6 +423,15 @@ func TestShouldEvictClient(t *testing.T) {
 			name: "DeadlineExceeded",
 			err:  fmt.Errorf("wrapped: %w", context.DeadlineExceeded),
 			want: true,
+		},
+		{
+			// Characterization of current behaviour, not intent: this is the
+			// error shape a real Temporal deadline produces, and the predicate
+			// does not match it. A fix to the predicate is expected to flip
+			// this expectation to true.
+			name: "DeadlineExceededFromGRPC",
+			err:  fmt.Errorf("wrapped: %w", wireDeadlineExceeded()),
+			want: false,
 		},
 		{
 			name: "Unavailable",
@@ -445,6 +465,23 @@ func TestShouldEvictClient(t *testing.T) {
 			assert.Equal(t, tt.want, shouldEvictClient(tt.err))
 		})
 	}
+
+	// Records why the DeadlineExceededFromGRPC case above returns false, so the
+	// expectation is traceable to a mechanism rather than to a bare assertion.
+	t.Run("WireDeadlineIsNotTheContextSentinel", func(t *testing.T) {
+		err := fmt.Errorf("unable to describe worker deployment: %w", wireDeadlineExceeded())
+		t.Logf("concrete type reaching the controller: %T", wireDeadlineExceeded())
+
+		assert.False(t, errors.Is(err, context.DeadlineExceeded),
+			"*serviceerror.DeadlineExceeded implements neither Unwrap nor Is, so errors.Is cannot match the sentinel")
+
+		var deadlineExceeded *serviceerror.DeadlineExceeded
+		assert.True(t, errors.As(err, &deadlineExceeded),
+			"errors.As does match, because this is the concrete type the SDK produces")
+
+		assert.Equal(t, "context deadline exceeded", err.Error()[len("unable to describe worker deployment: "):],
+			"the message text survives the conversion, which is why logs look like the sentinel")
+	})
 }
 
 // ─── Reconcile tests ──────────────────────────────────────────────────────────
@@ -764,6 +801,44 @@ func TestReconcile_EvictsCachedClientOnTransportFailure(t *testing.T) {
 	require.False(t, ok, "poisoned client must be evicted so the next reconcile dials a fresh one")
 }
 
+// TestReconcile_DoesNotEvictOnWireDeadline records what happens on the main
+// Reconcile path when the Describe failure arrives in the shape a real Temporal
+// deadline produces, rather than as the raw context sentinel the test above
+// injects. The cached client is retained, so the next reconcile reuses it.
+//
+// The assertions are deliberately the inverse of the test above. This documents
+// current behaviour; a fix to the eviction predicate is expected to flip it.
+func TestReconcile_DoesNotEvictOnWireDeadline(t *testing.T) {
+	k8sNamespace := "default"
+	hostPort := "localhost:7233"
+
+	conn := makeNoCredsConnection("my-conn", k8sNamespace, hostPort)
+	twd := makeWD("test-worker", k8sNamespace, conn.Name)
+
+	r, recorder := newTestReconciler([]client.Object{twd, conn})
+
+	poolKey := noCredsPoolKey(conn.Spec.HostPort, twd.Spec.WorkerOptions.TemporalNamespace)
+	poisoned := newStubTemporalClient(nil)
+	poisoned.describeDeploymentErr = wireDeadlineExceeded()
+	r.TemporalClientPool.SetClientForTesting(poolKey, poisoned)
+
+	cached, ok := r.TemporalClientPool.GetSDKClient(poolKey)
+	require.True(t, ok, "poisoned client should be cached before Reconcile runs")
+	require.Same(t, poisoned, cached)
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: twd.Name, Namespace: twd.Namespace},
+	})
+	require.Error(t, err, "Reconcile must still surface the Temporal Describe error")
+	assert.False(t, errors.Is(err, context.DeadlineExceeded),
+		"the wire error is not the context sentinel, so errors.Is does not match it")
+	assertEventEmitted(t, drainEvents(recorder), temporaliov1alpha1.ReasonTemporalStateFetchFailed)
+
+	cached, ok = r.TemporalClientPool.GetSDKClient(poolKey)
+	require.True(t, ok, "the client is NOT evicted, because the eviction predicate did not match the wire error")
+	require.Same(t, poisoned, cached, "the same poisoned client stays cached for the next reconcile")
+}
+
 // ─── executeK8sOperations tests ──────────────────────────────────────────────
 
 func TestExecuteK8sOperations_EmitsEventOnFailure(t *testing.T) {
@@ -944,6 +1019,45 @@ func TestHandleDeletion_EvictsCachedClientOnTemporalFailure(t *testing.T) {
 
 		_, ok = r.TemporalClientPool.GetSDKClient(poolKey)
 		require.False(t, ok, "poisoned client must be evicted from the pool after a Temporal-server-side failure so the next reconcile dials a fresh one")
+	})
+
+	t.Run("DescribeWireDeadline_RetainsClient", func(t *testing.T) {
+		// Same scenario as DescribeError_EvictsClient, but the Describe failure
+		// arrives in the shape a real Temporal deadline produces instead of as
+		// the raw context sentinel. The client is retained, so the finalizer
+		// reuses it on every requeue.
+		//
+		// The assertions are deliberately the inverse of the subtest above.
+		// This documents current behaviour; a fix to the eviction predicate is
+		// expected to flip it.
+		k8sNamespace := "default"
+		hostPort := "localhost:7233"
+
+		conn := makeNoCredsConnection("my-conn", k8sNamespace, hostPort)
+		twd := makeWD("del-worker", k8sNamespace, conn.Name)
+
+		r, _ := newTestReconciler([]client.Object{twd, conn})
+
+		poolKey := noCredsPoolKey(conn.Spec.HostPort, twd.Spec.WorkerOptions.TemporalNamespace)
+		poisoned := &stubTemporalClient{
+			wdClient: &stubWDClient{handle: &stubWDHandle{
+				describeErr: wireDeadlineExceeded(),
+			}},
+		}
+		r.TemporalClientPool.SetClientForTesting(poolKey, poisoned)
+
+		cached, ok := r.TemporalClientPool.GetSDKClient(poolKey)
+		require.True(t, ok, "poisoned client should be cached before handleDeletion runs")
+		require.Same(t, poisoned, cached)
+
+		err := r.handleDeletion(context.Background(), logr.Discard(), twd)
+		require.Error(t, err, "handleDeletion must still surface the Temporal Describe error")
+		assert.False(t, errors.Is(err, context.DeadlineExceeded),
+			"the wire error is not the context sentinel, so errors.Is does not match it")
+
+		cached, ok = r.TemporalClientPool.GetSDKClient(poolKey)
+		require.True(t, ok, "the client is NOT evicted, because the eviction predicate did not match the wire error")
+		require.Same(t, poisoned, cached, "the same poisoned client stays cached for the next requeue")
 	})
 
 	t.Run("DescribeNotFound_RetainsClient", func(t *testing.T) {
